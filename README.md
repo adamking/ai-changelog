@@ -23,7 +23,7 @@ A command-line tool that uses OpenAI's GPT models to analyze your staged changes
 
 1. First, tap the repository:
 ```bash
-brew tap adamlui/ai-changelog
+brew tap adamking/ai-changelog
 ```
 
 2. Then install the package:
@@ -35,7 +35,7 @@ brew install ai-changelog
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/adamlui/ai-changelog.git
+git clone https://github.com/adamking/ai-changelog.git
 cd ai-changelog
 ```
 
