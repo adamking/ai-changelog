@@ -1,0 +1,325 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# Version
+VERSION="1.0.0"
+
+# Constants
+API_URL="https://api.openai.com/v1/chat/completions"
+EXCLUDED_FILE="CHANGELOG.md"
+DEFAULT_MODEL="gpt-4-1106-preview"
+DEFAULT_TEMPERATURE=0.3
+DEFAULT_MAX_TOKENS=500
+CONFIG_FILE="${HOME}/.ai-changelog.config"
+
+# Variables
+MODEL="$DEFAULT_MODEL"
+TEMPERATURE="$DEFAULT_TEMPERATURE"
+MAX_TOKENS="$DEFAULT_MAX_TOKENS"
+VERBOSE=false
+
+# Function to display usage instructions
+usage() {
+    cat <<EOF
+ai-changelog v${VERSION}
+A tool to generate changelog entries and commit messages using AI.
+
+Usage: $(basename "$0") [options]
+
+Options:
+  -h, --help            Display this help message and exit
+  -m, --model MODEL     Specify the OpenAI model to use (default: ${DEFAULT_MODEL})
+  -t, --temperature T   Set the temperature for the OpenAI API (default: ${DEFAULT_TEMPERATURE})
+  -k, --max-tokens N    Define the maximum tokens for response (default: ${DEFAULT_MAX_TOKENS})
+  -v, --verbose         Enable verbose mode for detailed logging
+  --version            Display version information
+  --config PATH        Specify a custom config file path
+
+Examples:
+  $(basename "$0")                           # Basic usage with defaults
+  $(basename "$0") -m gpt-4 -t 0.5          # Custom model and temperature
+  $(basename "$0") -k 600 -v                # More tokens and verbose logging
+EOF
+}
+
+# Function to display version
+version() {
+    echo "ai-changelog version ${VERSION}"
+}
+
+# Function to print verbose messages
+log() {
+    if [ "$VERBOSE" = true ]; then
+        echo "DEBUG: $1" >&2
+    fi
+}
+
+# Function to print error messages and exit
+error_exit() {
+    echo "Error: $1" >&2
+    exit 1
+}
+
+# Function to print warning messages
+warn() {
+    echo "Warning: $1" >&2
+}
+
+# Function to check dependencies
+check_dependencies() {
+    local dependencies=("git" "jq" "curl")
+    for cmd in "${dependencies[@]}"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            error_exit "'$cmd' is not installed. Please install it and try again."
+        fi
+        log "Found dependency: $cmd"
+    done
+}
+
+# Function to load configuration
+load_config() {
+    local config_path="${1:-$CONFIG_FILE}"
+    if [ -f "$config_path" ]; then
+        log "Loading configuration from: $config_path"
+        if ! config=$(jq -r '.' "$config_path"); then
+            error_exit "Failed to parse configuration file"
+        fi
+        
+        # Load values if they exist in config
+        MODEL=$(echo "$config" | jq -r '.model // empty') || MODEL="$DEFAULT_MODEL"
+        TEMPERATURE=$(echo "$config" | jq -r '.temperature // empty') || TEMPERATURE="$DEFAULT_TEMPERATURE"
+        MAX_TOKENS=$(echo "$config" | jq -r '.max_tokens // empty') || MAX_TOKENS="$DEFAULT_MAX_TOKENS"
+        
+        log "Loaded configuration: model=$MODEL, temperature=$TEMPERATURE, max_tokens=$MAX_TOKENS"
+    else
+        log "No configuration file found at: $config_path"
+    fi
+}
+
+# Function to check required environment variables
+check_env() {
+    if [ -z "${OPENAI_API_KEY:-}" ]; then
+        error_exit "OPENAI_API_KEY environment variable is not set. Please set it with: export OPENAI_API_KEY='your-api-key'"
+    fi
+    log "OPENAI_API_KEY is set"
+}
+
+# Function to retrieve git diff
+get_git_diff() {
+    local diff_output
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        error_exit "Not in a git repository"
+    fi
+    
+    diff_output=$(git diff --cached -- ":!${EXCLUDED_FILE}") || error_exit "Failed to get git diff."
+    
+    if [ -z "$diff_output" ]; then
+        error_exit "No staged changes detected. Please stage your changes using 'git add' first."
+    fi
+    
+    echo "$diff_output"
+}
+
+# Function to construct JSON payload
+construct_payload() {
+    local diff_content sys_message user_message payload
+
+    diff_content="$1"
+    sys_message="You are a helpful assistant that analyzes git diffs and suggests both a changelog entry and a commit message. For the changelog:
+1. Use Keep a Changelog format with appropriate sections (Added/Changed/Fixed/etc)
+2. Each change must list the affected files indented below the change
+3. Format file paths with backticks
+4. Be specific about what changed in each file
+
+Example format:
+### Added
+- New feature description
+  - \`path/to/file.ext\`: What changed in this file
+  - \`another/file.ext\`: What changed here
+
+### Changed
+- Change description
+  - \`path/to/file.ext\`: Specific changes made"
+
+    user_message="Analyze this git diff and suggest:
+1. A changelog entry
+2. A commit message
+
+Diff:
+$diff_content"
+
+    payload=$(jq -n \
+        --arg model "$MODEL" \
+        --arg sys_msg "$sys_message" \
+        --arg user_msg "$user_message" \
+        --argjson temperature "$TEMPERATURE" \
+        --argjson max_tokens "$MAX_TOKENS" \
+        '{
+            model: $model,
+            messages: [
+                {role: "system", content: $sys_msg},
+                {role: "user", content: $user_msg}
+            ],
+            temperature: $temperature,
+            max_tokens: $max_tokens
+        }') || error_exit "Failed to construct API payload"
+
+    echo "$payload"
+}
+
+# Function to call OpenAI API
+call_openai_api() {
+    local payload response http_code
+    local max_retries=3
+    local retry_count=0
+    local wait_time=2
+
+    payload="$1"
+    
+    while [ $retry_count -lt $max_retries ]; do
+        log "Attempting API call (attempt $((retry_count + 1))/$max_retries)"
+        
+        response=$(curl -sSf -w "%{http_code}" --max-time 30 "$API_URL" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            -d "$payload") || {
+                http_code=$?
+                if [ $retry_count -lt $((max_retries - 1)) ]; then
+                    warn "API call failed with code $http_code. Retrying in $wait_time seconds..."
+                    sleep $wait_time
+                    wait_time=$((wait_time * 2))
+                    retry_count=$((retry_count + 1))
+                    continue
+                fi
+                error_exit "API call failed after $max_retries attempts"
+            }
+        
+        # Extract HTTP status code
+        http_code=${response: -3}
+        response=${response:0:$((${#response} - 3))}
+        
+        # Check HTTP status code
+        if [ "$http_code" = "200" ]; then
+            echo "$response"
+            return 0
+        elif [ "$http_code" = "429" ]; then
+            if [ $retry_count -lt $((max_retries - 1)) ]; then
+                warn "Rate limit exceeded. Retrying in $wait_time seconds..."
+                sleep $wait_time
+                wait_time=$((wait_time * 2))
+                retry_count=$((retry_count + 1))
+                continue
+            fi
+        else
+            error_exit "API returned error: $response"
+        fi
+    done
+    
+    error_exit "Failed to get successful response after $max_retries attempts"
+}
+
+# Function to parse API response
+parse_response() {
+    local api_response changelog
+
+    api_response="$1"
+    changelog=$(echo "$api_response" | jq -r '.choices[0].message.content') || error_exit "Failed to parse API response"
+
+    if [ -z "$changelog" ]; then
+        error_exit "Received empty response from API"
+    fi
+
+    echo "$changelog"
+}
+
+# Function to display changelog
+display_changelog() {
+    local changelog_content
+
+    changelog_content="$1"
+
+    echo
+    echo "📝 Changelog Suggestion:"
+    echo "----------------------------------------"
+    echo "$changelog_content"
+    echo "----------------------------------------"
+}
+
+# Main function
+main() {
+    local custom_config=""
+
+    # Parse command-line options
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            --version)
+                version
+                exit 0
+                ;;
+            -m|--model)
+                MODEL="$2"
+                shift 2
+                ;;
+            -t|--temperature)
+                TEMPERATURE="$2"
+                shift 2
+                ;;
+            -k|--max-tokens)
+                MAX_TOKENS="$2"
+                shift 2
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            --config)
+                custom_config="$2"
+                shift 2
+                ;;
+            *)
+                error_exit "Unknown option: $1"
+                ;;
+        esac
+    done
+
+    log "Starting ai-changelog v${VERSION}"
+
+    check_dependencies
+    log "All dependencies are installed"
+    
+    # Load configuration (if exists)
+    if [ -n "$custom_config" ]; then
+        load_config "$custom_config"
+    else
+        load_config
+    fi
+    
+    check_env
+    log "Environment variables are set"
+
+    diff=$(get_git_diff)
+    log "Git diff retrieved"
+
+    echo "Analyzing changes..."
+
+    payload=$(construct_payload "$diff")
+    log "JSON payload constructed"
+
+    api_response=$(call_openai_api "$payload")
+    log "Received response from OpenAI API"
+
+    changelog=$(parse_response "$api_response")
+    log "Changelog parsed"
+
+    display_changelog "$changelog"
+
+    log "ai-changelog completed successfully"
+}
+
+# Execute main function with all arguments
+main "$@" 
